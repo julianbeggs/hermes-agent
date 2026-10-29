@@ -683,6 +683,20 @@ def _unknown_cost(source: CostSource, *notes: str) -> CostResult:
     return CostResult(amount_usd=None, status="unknown", source=source, label="n/a", notes=notes)
 
 
+def _negative_cost_result(source: CostSource, amount: Decimal, *notes: str) -> CostResult:
+    """A negative amount is a provider sentinel, never a price.
+
+    OpenRouter publishes ``-1`` for routes it cannot quote per token (variable-cost
+    aliases such as ``openrouter/auto``); that sentinel used to survive into
+    ``estimated_cost_usd`` and was rejected downstream as out-of-range, killing a
+    worker's usage write. Report unknown instead so nothing folds it into a total.
+    """
+    return CostResult(
+        amount_usd=None, status="unknown", source=source, label="n/a",
+        notes=(f"provider reported a negative cost sentinel ({amount}) — treated as unknown", *notes),
+    )
+
+
 def estimate_usage_cost(
     model_name: str, usage: CanonicalUsage, *, provider: Optional[str] = None,
     base_url: Optional[str] = None, api_key: Optional[str] = None,
@@ -691,6 +705,8 @@ def estimate_usage_cost(
     profile = get_provider_profile(provider or '')
     reported = profile.get_usage_cost(model_name, usage) if profile else None
     if reported is not None:
+        if reported.amount_usd is not None and reported.amount_usd < _ZERO:
+            return _negative_cost_result(reported.source, reported.amount_usd, *reported.notes)
         return reported
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -735,6 +751,13 @@ def estimate_usage_cost(
 
     notes: list[str] = []
     status: CostStatus = "estimated"
+    if amount < _ZERO:
+        # A negative per-token rate (openrouter/auto's -1 sentinel) makes the product
+        # negative: never a quote, and never something a session total can absorb.
+        if route.provider == "openrouter":
+            return _negative_cost_result(
+                entry.source, amount, "OpenRouter cost is estimated from the models API until reconciled.")
+        return _negative_cost_result(entry.source, amount)
     label = format_cost_label(amount)
     if entry.source == "none" and amount == _ZERO:
         status = "included"

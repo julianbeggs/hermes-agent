@@ -885,6 +885,13 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
     allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task'})
     if set(payload) - allowed:
         raise RuntimeStoreError('invalid_params')
+    # A negative cost is a provider sentinel (openrouter/auto quotes -1), never a price, and
+    # older clients still send it. Sanitize rather than refuse: rejecting it killed the whole
+    # worker on its usage write, and the rollup treats a missing cost as unknown anyway.
+    for key in ('estimated_cost_usd', 'actual_cost_usd'):
+        value = payload.get(key)
+        if isinstance(value, (int, float)) and value < 0:
+            payload = {**payload, key: None}
     for key, value in payload.items():
         if key in (*_TOKEN_COUNTERS, 'api_call_count'):
             valid = type(value) is int and 0 <= value <= 2**53

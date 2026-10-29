@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
@@ -68,6 +68,41 @@ def _fold_moa_usage(agent, canonical_usage):
         except Exception as _moa_trace_exc:  # pragma: no cover - defensive
             logger.debug("MoA trace flush failed: %s", _moa_trace_exc)
     return _moa_client, canonical_usage, _moa_ref_cost
+
+
+def _turn_cost_delta(agent: Any, cost_result: Any, moa_ref_cost: Any) -> tuple[Optional[float], str]:
+    """This call's cost delta and the status to record with it.
+
+    Delta = aggregator quote + MoA advisor spend (already priced per advisor at each
+    advisor's own model rate), so state.db's ``estimated_cost_usd`` matches the folded
+    token counts. A provider cost sentinel (``openrouter/auto`` quotes ``-1`` for routes
+    it cannot price) is recorded as unknown: persisting it is rejected downstream as
+    out-of-range and would kill the worker's usage write, so it never enters the delta
+    or the session total.
+    """
+    delta: Optional[float] = None
+    status = cost_result.status
+    amount = cost_result.amount_usd
+    if amount is not None:
+        amount = float(amount)
+        if amount < 0:
+            status = "unknown"
+            logger.debug(
+                "Negative cost sentinel from provider=%s model=%s (%s); recording cost as unknown",
+                getattr(agent, "provider", None) or "unknown", getattr(agent, "model", None), amount,
+            )
+        else:
+            delta = amount
+            agent.session_estimated_cost_usd += delta
+    if moa_ref_cost is not None:
+        try:
+            moa_cost = float(moa_ref_cost)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            moa_cost = None
+        if moa_cost is not None and moa_cost >= 0:
+            agent.session_estimated_cost_usd += moa_cost
+            delta = (delta or 0.0) + moa_cost
+    return delta, status
 
 
 def record_response_usage(
@@ -236,19 +271,8 @@ def record_response_usage(
     # Cost delta = aggregator + MoA advisor cost (already priced per-advisor at each
     # advisor's own model rate), so state.db's estimated_cost_usd matches the folded
     # token counts.
-    _cost_delta = None
-    if cost_result.amount_usd is not None:
-        _cost_delta = float(cost_result.amount_usd)
-        agent.session_estimated_cost_usd += _cost_delta
-    if _moa_ref_cost is not None:
-        try:
-            _moa_cost = float(_moa_ref_cost)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            _moa_cost = None
-        if _moa_cost is not None:
-            agent.session_estimated_cost_usd += _moa_cost
-            _cost_delta = (_cost_delta or 0.0) + _moa_cost
-    agent.session_cost_status = cost_result.status
+    _cost_delta, _cost_status = _turn_cost_delta(agent, cost_result, _moa_ref_cost)
+    agent.session_cost_status = _cost_status
     agent.session_cost_source = cost_result.source
 
     # Persist per-call token deltas for any session_id so non-CLI runs can't lose
@@ -270,7 +294,7 @@ def record_response_usage(
                 cache_write_tokens=canonical_usage.cache_write_tokens,
                 reasoning_tokens=canonical_usage.reasoning_tokens,
                 estimated_cost_usd=_cost_delta,
-                cost_status=cost_result.status,
+                cost_status=_cost_status,
                 cost_source=cost_result.source,
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,

@@ -54,3 +54,33 @@ def test_worker_voice_turn_usage_counts_but_never_rewrites_the_session_route(tmp
         assert db.auxiliary_usage_by_task('s')['voice_chat']['input_tokens'] == 10
     finally:
         db.close()
+
+
+def test_negative_cost_sentinel_is_sanitized_not_rejected(tmp_path):
+    """Older clients still send openrouter/auto's ``-1`` cost sentinel.
+
+    Refusing that payload raised ``invalid_params`` and killed the worker on its
+    first usage write; the runtime now drops the cost (unknown) and keeps the
+    token accounting.
+    """
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', source='cli')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
+        rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
+        payload = {'input_tokens': 13, 'output_tokens': 7, 'api_call_count': 1,
+                   'model': 'openrouter/auto', 'billing_provider': 'openrouter',
+                   'estimated_cost_usd': -1.0, 'cost_status': 'unknown',
+                   'cost_source': 'provider_models_api'}
+        rt.mutate_worker_execution(db, **scope, sequence=1, operation='usage.main', payload=payload)
+        row = db.get_session('s')
+        assert (row['input_tokens'], row['output_tokens']) == (13, 7)
+        assert not row.get('estimated_cost_usd')
+        # A positive cost still lands, so the clamp is not a blanket drop.
+        rt.mutate_worker_execution(
+            db, **(scope | {'sequence': 2, 'operation': 'usage.main',
+                            'payload': dict(payload, estimated_cost_usd=0.25)}))
+        assert db.get_session('s')['estimated_cost_usd'] == pytest.approx(0.25)
+    finally:
+        db.close()
