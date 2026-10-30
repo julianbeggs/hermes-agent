@@ -4894,6 +4894,8 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
 
 def _stop_cron_provider(provider) -> None:
     """Stop a cron provider without letting it choose the gateway exit code."""
+    if provider is None:
+        return
     try:
         provider.stop()
     except SystemExit as exc:
@@ -5689,7 +5691,26 @@ async def _start_gateway_start_control_socket(runner):
 
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
-    ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``.
+
+    When ``HERMES_TUI_SKIP_CRON=1`` the cron ticker is bypassed (TUI co-existence
+    guard — avoids duplicate ticks when the TUI runs alongside a systemd gateway).
+    """
+
+    # --- TUI co-existence guard ---
+    if os.environ.get("HERMES_TUI_SKIP_CRON") == "1":
+        logger.info("Skipping cron scheduler — systemd gateway already handles cron for this profile")
+        cron_stop = threading.Event()
+        cron_provider = None
+        cron_thread = None
+        housekeeping_thread = threading.Thread(
+            target=_start_gateway_housekeeping, args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
+                    "cron_provider": None, "runner": runner, "cron_thread": None},
+            daemon=True, name="gateway-housekeeping")
+        housekeeping_thread.start()
+        return cron_stop, cron_provider, cron_thread, housekeeping_thread
+
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)

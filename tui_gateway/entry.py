@@ -10,6 +10,7 @@ hermes_bootstrap.harden_import_path()
 import json
 import logging
 import signal
+import subprocess
 import threading
 import time
 import traceback
@@ -24,6 +25,37 @@ from tui_gateway.server import _CRASH_LOG, _err, dispatch, resolve_skin, write_j
 from tui_gateway.transport import TeeTransport
 
 logger = logging.getLogger(__name__)
+
+
+def _systemd_gateway_running_for_profile() -> bool:
+    """Check if a systemd gateway is already running for this profile.
+
+    When the user has a systemd gateway service (persistent, survives reboots)
+    and also opens a TUI session for the same profile, both processes start
+    their own cron scheduler.  This causes every cron job to fire twice per
+    tick — wasteful, and can produce duplicate side effects (e.g. double
+    GitHub issue comments).  We detect the existing systemd gateway and set
+    ``HERMES_TUI_SKIP_CRON`` so the TUI instance skips its own cron ticker.
+    """
+    if sys.platform != "linux":
+        return False
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet",
+             "hermes-gateway.service", "hermes-gateway-orchestrator.service"],
+            capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+if _systemd_gateway_running_for_profile():
+    os.environ["HERMES_TUI_SKIP_CRON"] = "1"
+    logger.info(
+        "Systemd gateway already running for this profile — "
+        "TUI will skip its own cron scheduler to avoid duplicate ticks."
+    )
 
 # Discovery thread spawned by THIS module; None when delegated to the shared owner in
 # hermes_cli.mcp_startup (current path). The wait/in-flight/join helpers consult both.

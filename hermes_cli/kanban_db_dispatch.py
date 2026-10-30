@@ -2896,6 +2896,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # The worker subprocess (sys.executable -m hermes_cli.main) inherits a
+    # sanitized env with Hermes-owned PYTHONPATH stripped by
+    # _strip_hermes_owned_pythonpath_and_runtime_markers. The store Python
+    # (sys.executable) cannot find hermes_cli without the repo root — re-pin
+    # it here, mirroring the cron external worker pattern (pin_hermes_tree_on_pythonpath).
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    existing_pp = env.get("PYTHONPATH", "")
+    pp_entries = [e for e in existing_pp.split(os.pathsep) if e]
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([repo_root, *pp_entries]))
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
