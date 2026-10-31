@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 import sys
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -397,11 +398,18 @@ def execute(frame, channel):
                 frame = {**frame, 'text': content}
             before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
                       getattr(agent, 'session_completion_tokens', 0) or 0)
+            turn_started_epoch = time.time()
             # Most failed results name no provider or model; the owner's error card needs the agent's.
             result = {'provider': getattr(agent, 'provider', None), 'model': getattr(agent, 'model', None),
                       **run_worker_turns(agent, frame, history)}
             result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
             result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
+            # openrouter/auto prices a sentinel, not the routed model: snapshot the turn for
+            # a post-finalize true-cost reconciliation before the agent is retired.
+            from agent.openrouter_cost import capture_turn_reconciliation_snapshot
+            reconciliation_snapshot = capture_turn_reconciliation_snapshot(
+                agent, start_epoch=turn_started_epoch, end_epoch=time.time(),
+                input_tokens=result['_turn_input_tokens'], output_tokens=result['_turn_output_tokens'])
             retire_agent(agent)
             agent = None
             # The auto-title thread bills through this store from a daemon thread; a title landing
@@ -409,6 +417,10 @@ def execute(frame, channel):
             from agent.title_generator import wait_for_title_upgrades
             wait_for_title_upgrades()
             store.flush_token_counts()
+            # Fail-soft true-cost reconciliation for OpenRouter-routed turns: an API error
+            # leaves the estimated/unknown status as-is and never blocks worker exit.
+            from agent.openrouter_cost import maybe_schedule_reconciliation
+            maybe_schedule_reconciliation(store, scope['session_id'], reconciliation_snapshot)
             if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
                 result['final_response'] = ''
             channel.send('result', result=result_frame(result))
