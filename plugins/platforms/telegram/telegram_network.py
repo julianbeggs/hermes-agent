@@ -130,14 +130,11 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             logger.debug("[Telegram] Error closing fallback transport %s: %s", ip, exc)
 
     def _attempt_order(self) -> list[Optional[str]]:
-        """Sticky path first, then IPv4 literals, dual-stack hostname last (a blackholed IPv6 path never
-        errors — Happy Eyeballs waits on AAAA until the OS TCP timeout and can pin the loop)."""
-        order: list[Optional[str]] = []
-        if self._sticky_ip is not _UNSET:
-            order.append(None if self._sticky_ip is None else str(self._sticky_ip))
+        """DNS hostname first (api.telegram.org), IPv4 literals as fallback only.
+        Sticky IP (#87015) disabled — WSL path to fixed Telegram IPs is unreliable,
+        DNS-based path always works."""
+        order: list[Optional[str]] = [None]  # primary transport = DNS hostname first
         order.extend(ip for ip in self._fallback_ips if ip not in order)
-        if None not in order:
-            order.append(None)
         return order
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:

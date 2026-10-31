@@ -818,14 +818,17 @@ def row_annotations(messages):
 
 def _worker_append(db, conn, session_id, payload):
     if set(payload) - {'messages', 'turn_lease_holder'} or 'messages' not in payload:
-        raise RuntimeStoreError('invalid_params')
+        raise RuntimeStoreError('invalid_params', field='append_payload',
+            detail=f'keys={sorted(set(payload))}')
     messages = payload['messages']
     if not isinstance(messages, list) or len(messages) > 1000:
         raise RuntimeStoreError('invalid_params')
     for msg in messages:
         if (not isinstance(msg, dict) or set(msg) - _MESSAGE_FIELDS
                 or msg.get('role') not in ('user', 'assistant', 'system', 'tool')):
-            raise RuntimeStoreError('invalid_params')
+            raise RuntimeStoreError('invalid_params', field='append_message',
+                detail=f'extra={sorted(set(msg) - _MESSAGE_FIELDS)} role={msg.get("role")}'
+                       f' nmsg={len(messages)}')
         # Existing row annotations can adopt only rows in THIS transcript.
         if '_row_id' in msg and not conn.execute(
                 'SELECT 1 FROM messages WHERE id=? AND session_id=?',
@@ -955,7 +958,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     """
     from hermes_state_worker_compression import worker_receipt_assignment
     if type(sequence) is not int or sequence < 1 or not isinstance(operation, str) or operation not in handlers:
-        raise RuntimeStoreError('invalid_params')
+        raise RuntimeStoreError('invalid_params', field='receipt',
+            detail=f'op={operation!r} seq={sequence!r} known={operation in handlers if isinstance(operation,str) else None}')
     encoded = _json(payload)
     if len(encoded.encode('utf-8', errors='surrogatepass')) > 4 * 1024 * 1024:
         raise RuntimeStoreError('invalid_params')

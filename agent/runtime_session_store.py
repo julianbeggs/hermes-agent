@@ -200,6 +200,12 @@ class WorkerRPC:
                 self._drop()
                 raise
             if 'error' in response:
+                try:
+                    _diag_file('RPC-REFUSED method=%s op=%s keys=%s error=%r' % (
+                        method, params.get('operation'), sorted(params.get('payload') or {}),
+                        response['error']))
+                except Exception:
+                    pass
                 raise WorkerPersistenceError(response['error'].get('message', 'persistence_failed'))
             if method in ('worker.register', 'worker.adopt') and params.get('pid') == os.getpid():
                 global _worker_process
@@ -325,7 +331,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             try:
                 self._save(candidate)
             except Exception as exc:
-                self.failure = str(exc)
+                detail = getattr(exc, 'detail', None)
+                self.failure = f'{exc}:{detail}' if detail else str(exc)
+                try:
+                    import logging
+                    logging.getLogger('agent.runtime_session_store').warning(
+                        'PERSIST-FAIL op=%s keys=%s pending=%s detail=%r',
+                        entry.get('operation'), sorted(entry.get('payload') or {}),
+                        [e.get('operation') for e in self.journal['pending']], detail)
+                except Exception:
+                    pass
                 raise
             self.journal = candidate
             return self.retry_pending()[0]
@@ -344,7 +359,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
-                self.failure = str(exc)
+                detail = getattr(exc, 'detail', None)
+                self.failure = f'{exc}:{detail}' if detail else str(exc)
+                _diag_file(f'RPC-FAIL-VALUES payload={ (entry.get("payload") or {}) !r} '
+                           f'pending={[e.get("operation") for e in self.journal["pending"]]} exc={exc!r}')
                 raise
             self.failure = None
             return results
@@ -398,6 +416,28 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def queue_token_counts(self, session_id, **usage):
         self._session(session_id)
+        # One out-of-range field fails the AUTHORITY's validation and poisons this worker's whole
+        # persistence journal (every later append reports the same refusal and the turn is lost),
+        # so never let a provider artefact — a None counter, a negative cost estimate — reach the
+        # wire. Counters floor at 0; costs floor at 0 and must be finite.
+        for key in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+                    'reasoning_tokens', 'api_call_count'):
+            if key in usage:
+                value = usage[key]
+                if value is None:
+                    usage[key] = 0
+                elif type(value) is not int:
+                    try:
+                        usage[key] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        usage[key] = 0
+        for key in ('estimated_cost_usd', 'actual_cost_usd'):
+            if key in usage and usage[key] is not None:
+                value = usage[key]
+                if type(value) is not int and type(value) is not float or value != value:
+                    usage[key] = 0
+                elif value < 0:
+                    usage[key] = 0.0
         self._apply('usage.main', usage)
 
     def record_auxiliary_usage(self, session_id, task, **usage):
@@ -407,6 +447,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def flush_token_counts(self, timeout=5.0):
         with self.lock:
             if self.failure:
+                _diag_file(f'FLUSH-RAISE failure={self.failure!r} pending={[e.get("operation") for e in self.journal["pending"]]}')
                 raise WorkerPersistenceError(self.failure)
             if self.journal['pending']:
                 raise WorkerPersistenceError('pending_receipt')
@@ -495,3 +536,58 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self.flush_token_counts()
             finally:
                 self._outbox_owner.close()
+
+
+def _diag_validate_entry(operation, payload):
+    """Diagnostic: name the exact reason the owner would refuse this mutation.
+
+    Runs worker-side (fresh process per dispatch) so no gateway restart is needed to
+    see why ``worker.persist`` answers ``invalid_params``. Logs to the worker's stderr,
+    which the owner drains into the profile's managed-worker.log.
+    """
+    import logging
+    log = logging.getLogger('agent.runtime_session_store')
+    try:
+        json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        bad = []
+        def walk(value, path='payload'):
+            if isinstance(value, float) and value != value:
+                bad.append(f'{path}=NaN')
+            elif isinstance(value, (bytes, bytearray)):
+                bad.append(f'{path}=bytes')
+            elif isinstance(value, (set, frozenset)):
+                bad.append(f'{path}=set')
+            elif isinstance(value, dict):
+                for k, v in value.items():
+                    walk(v, f'{path}.{k}')
+            elif isinstance(value, (list, tuple)):
+                for i, v in enumerate(value[:50]):
+                    walk(v, f'{path}[{i}]')
+        walk(payload)
+        _diag_file(f'JSON-FAIL op={operation} exc={exc!r} offenders={"; ".join(bad[:10]) or "unwalked"}')
+    if operation == 'transcript.append':
+        try:
+            from hermes_state_runtime import _MESSAGE_FIELDS
+        except Exception:
+            return
+        msgs = payload.get('messages') or []
+        for i, msg in enumerate(msgs if isinstance(msgs, list) else []):
+            if not isinstance(msg, dict):
+                log.warning('PERSIST-DIAG append msg[%d] not a dict: %r', i, type(msg))
+                continue
+            extra = set(msg) - _MESSAGE_FIELDS
+            if extra:
+                _diag_file(f'MSG-EXTRA-FIELDS msg[{i}] extra={sorted(extra)}')
+            if msg.get('role') not in ('user', 'assistant', 'system', 'tool'):
+                _diag_file(f'MSG-BAD-ROLE msg[{i}] role={msg.get("role")!r}')
+
+def _diag_file(msg):
+    """Worker-side diagnostics go straight to a file: the module logger has no handler in a
+    managed worker, so WARNING lines vanish (root logger is unattached there)."""
+    try:
+        import os, time as _t
+        with open('/tmp/persist-diag.log', 'a') as fh:
+            fh.write(f'{_t.strftime("%H:%M:%S")} [{os.getpid()}] {msg}\n')
+    except Exception:
+        pass
