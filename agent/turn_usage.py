@@ -250,6 +250,10 @@ def record_response_usage(
         if _moa_cost is not None:
             agent.session_estimated_cost_usd += _moa_cost
             _cost_delta = (_cost_delta or 0.0) + _moa_cost
+    # Re-clamp AFTER the MoA aggregation: an advisor priced with the same negative
+    # sentinel re-poisons the delta even when the primary estimate was clamped.
+    if _cost_delta is not None:
+        _cost_delta = max(0.0, _cost_delta)
     agent.session_cost_status = cost_result.status
     agent.session_cost_source = cost_result.source
 
