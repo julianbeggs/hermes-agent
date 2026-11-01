@@ -238,7 +238,9 @@ def record_response_usage(
     # token counts.
     _cost_delta = None
     if cost_result.amount_usd is not None:
-        _cost_delta = float(cost_result.amount_usd)
+        # A negative estimate is a pricing-sentinel artefact, and the state store rejects
+        # negatives wholesale (failing the turn's entire persistence). Cost floors at zero.
+        _cost_delta = max(0.0, float(cost_result.amount_usd))
         agent.session_estimated_cost_usd += _cost_delta
     if _moa_ref_cost is not None:
         try:

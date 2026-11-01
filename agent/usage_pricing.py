@@ -531,7 +531,14 @@ def _pricing_entry_from_metadata(
         for alias in aliases:  # alias chain is truthiness-based (``a or b or c``)
             raw = raw or pricing.get(alias)
         value = _to_decimal(raw)
-        return None if value is None else value * _ONE_MILLION
+        # Providers use a negative sentinel for "priced dynamically" (OpenRouter publishes
+        # prompt/completion "-1" for auto-routed models). Multiplying that by a million turns a
+        # sentinel into -$1 per token: a huge negative estimate that the state authority's
+        # range check then rejects, which fails the whole turn's persistence. A negative unit
+        # price is never real, so treat it as unavailable.
+        if value is None or value < 0:
+            return None
+        return value * _ONE_MILLION
 
     prompt = per_million("prompt")
     completion = per_million("completion")
