@@ -398,6 +398,28 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def queue_token_counts(self, session_id, **usage):
         self._session(session_id)
+        # One out-of-range field fails the AUTHORITY's validation and poisons this worker's whole
+        # persistence journal (every later append reports the same refusal and the turn is lost),
+        # so never let a provider artefact — a None counter, a negative cost estimate — reach the
+        # wire. Counters floor at 0; costs floor at 0 and must be finite.
+        for key in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens',
+                    'reasoning_tokens', 'api_call_count'):
+            if key in usage:
+                value = usage[key]
+                if value is None:
+                    usage[key] = 0
+                elif type(value) is not int:
+                    try:
+                        usage[key] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        usage[key] = 0
+        for key in ('estimated_cost_usd', 'actual_cost_usd'):
+            if key in usage and usage[key] is not None:
+                value = usage[key]
+                if type(value) is not int and type(value) is not float or value != value:
+                    usage[key] = 0
+                elif value < 0:
+                    usage[key] = 0.0
         self._apply('usage.main', usage)
 
     def record_auxiliary_usage(self, session_id, task, **usage):
