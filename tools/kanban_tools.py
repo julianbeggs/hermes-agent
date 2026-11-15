@@ -784,6 +784,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.ReviewerCompletionError as verdict_err:
+            return tool_error(
+                f"kanban_complete blocked: {verdict_err}. Your task is still in-flight "
+                "(no state change). Compose the verdict first, then retry kanban_complete "
+                "with metadata={verdict: 'approved'|'changes_requested', "
+                "blocking_count: <non-negative integer>, findings: [...]}; include every "
+                "blocking finding in findings before making the terminal call.")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or

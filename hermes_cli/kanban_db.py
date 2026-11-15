@@ -2604,6 +2604,19 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class ReviewerCompletionError(ValueError):
+    """A code-reviewer completion omitted its machine-readable verdict contract."""
+
+    def __init__(self, task_id: str, problems: list[str]):
+        self.task_id = task_id
+        self.problems = list(problems)
+        super().__init__(
+            f"completion blocked: {task_id} is assigned to code-reviewer and requires "
+            "metadata with verdict='approved' or 'changes_requested', a non-negative "
+            f"integer blocking_count, and findings=[] ({'; '.join(problems)})"
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2658,7 +2671,9 @@ def complete_task(
     Completions from non-review statuses need evidence: a stripped ``result``
     or ``summary``, or a stripped result already stored on the card. Empty or
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
-    auditable event. Approving a card out of ``review`` stays exempt.
+    auditable event. Approving a card out of ``review`` stays exempt. Cards
+    assigned to ``code-reviewer`` additionally require their verdict contract,
+    so a terminal transition can never strand a blocking review.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2667,6 +2682,7 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    _gate_reviewer_completion(conn, task_id, metadata)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -2806,6 +2822,41 @@ def _gate_empty_completion(
             },
         )
     raise EmptyCompletionError(task_id)
+
+
+def _gate_reviewer_completion(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict],
+) -> None:
+    """Fail before the terminal write when a reviewer verdict would be lost.
+
+    This belongs in the kernel rather than only the tool adapter so CLI, dashboard,
+    and direct callers cannot bypass the contract. The audit event commits on its
+    own; task status, the active run, and its claim remain untouched for a retry.
+    """
+    row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row["assignee"] != "code-reviewer":
+        return
+
+    problems: list[str] = []
+    if not isinstance(metadata, dict):
+        problems.append("metadata must be an object")
+    else:
+        if metadata.get("verdict") not in {"approved", "changes_requested"}:
+            problems.append("verdict must be 'approved' or 'changes_requested'")
+        blocking_count = metadata.get("blocking_count")
+        if type(blocking_count) is not int or blocking_count < 0:
+            problems.append("blocking_count must be a non-negative integer")
+        if not isinstance(metadata.get("findings"), list):
+            problems.append("findings must be a list")
+    if not problems:
+        return
+
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "completion_blocked_reviewer_contract",
+            {"problems": problems},
+        )
+    raise ReviewerCompletionError(task_id, problems)
 
 
 def _stage_completion_artifacts(

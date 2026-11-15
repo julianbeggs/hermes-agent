@@ -108,16 +108,22 @@ For non-code work:
 
 #### Approve
 
-Approve only when the acceptance criteria are satisfied and the evidence is sufficient. Call:
+Approve only when the acceptance criteria are satisfied and the evidence is sufficient. Compose the contract first, then make one terminal call:
 
 ```text
+metadata = {
+    "verdict": "approved",
+    "blocking_count": 0,
+    "findings": [],
+    "reviewer_checks": [...],
+}
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    metadata=metadata,
 )
 ```
 
-Include the exact checks that passed and any bounded caveat that does not block acceptance.
+Include the exact checks that passed and any bounded caveat that does not block acceptance. The kernel rejects a reviewer completion without `verdict`, a non-negative integer `blocking_count`, and `findings[]`; the rejection is non-terminal, so re-issue the full payload rather than ending the run.
 
 #### Request changes
 

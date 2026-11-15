@@ -195,6 +195,46 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_reviewer_complete_error_is_non_terminal_and_actionable(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET assignee = 'code-reviewer' WHERE id = ?", (worker_env,))
+        conn.commit()
+
+    rejected = json.loads(kt._handle_complete({
+        "summary": "changes requested",
+        "metadata": {},
+    }))
+    assert rejected.get("error")
+    assert "still in-flight" in rejected["error"]
+    assert "verdict" in rejected["error"]
+    assert "blocking_count" in rejected["error"]
+    assert "findings" in rejected["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+    metadata = {
+        "verdict": "changes_requested",
+        "blocking_count": 1,
+        "findings": [{"severity": "critical", "file": "app.py", "line": 1,
+                      "issue": "broken", "suggested_fix": "repair it"}],
+    }
+    completed = json.loads(kt._handle_complete({
+        "summary": "changes requested",
+        "metadata": metadata,
+    }))
+    assert completed.get("ok") is True
+    with kbc.connect() as conn:
+        persisted = kb.latest_run(conn, worker_env).metadata
+        assert persisted["verdict"] == metadata["verdict"]
+        assert persisted["blocking_count"] == metadata["blocking_count"]
+        assert persisted["findings"] == metadata["findings"]
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
