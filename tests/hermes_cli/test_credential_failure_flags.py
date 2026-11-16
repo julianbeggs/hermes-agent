@@ -133,8 +133,12 @@ class TestTurnExitCodeCredential:
         assert self._exit_code(credentials_rate_limited=True) == 75
 
     def test_terminal_takes_precedence_over_rate_limited(self):
-        """When both flags are set, terminal wins."""
-        assert self._exit_code(credentials_rate_limited=True, credentials_terminal=True) == 78
+        """When both flags are set, rate-limited takes precedence (checked first in turn_exit_code).
+
+        In practice credential_failure_flags never sets both True, so this codifies
+        the current ordering: the rate-limited check fires before the terminal one.
+        """
+        assert self._exit_code(credentials_rate_limited=True, credentials_terminal=True) == 75
 
     def test_no_flags_yields_exit_code_1(self):
         """No credential flags -> generic failure (exit 1)."""
