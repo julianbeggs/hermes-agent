@@ -11,6 +11,19 @@ TRANSIENT_PROVIDER_REASONS = frozenset({
 TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
+# AuthError codes indicating the provider's credentials are missing or invalid — the operator
+# must configure/authenticate before retrying. Distinct from rate-limit/quota codes which are
+# transient and from entitlement/refresh codes that may resolve without operator intervention.
+CREDENTIAL_MISSING_CODES = frozenset({
+    "missing_api_key",
+    "no_provider_configured",
+    "invalid_provider",
+    "nous_auth_missing",
+    "qwen_auth_missing",
+    "codex_auth_missing",
+    "codex_auth_invalid_shape",
+    "corrupt_config",
+})
 
 
 def turn_exit_code(
@@ -45,15 +58,20 @@ def turn_exit_code(
 def credential_failure_flags(exc) -> dict:
     """``turn_exit_code`` credential kwargs for an exception raised before any turn result exists.
 
-    Same predicates as the one-shot CLI's ``_ensure_runtime_credentials``: a quota/rate-limit
-    ``AuthError`` is transient, only an explicit re-authentication requirement is terminal. The
-    cause chain is walked because agent construction wraps the resolver's error."""
+    A quota/rate-limit ``AuthError`` is transient (exit code 75).
+    An explicit re-authentication requirement *or* a
+    ``CREDENTIAL_MISSING_CODES`` code (missing/invalid provider configuration) is terminal
+    (exit code 78). The cause chain is walked because agent construction wraps the resolver's
+    error."""
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     seen = set()
     while exc is not None and id(exc) not in seen:
         seen.add(id(exc))
         if isinstance(exc, AuthError):
-            return {"credentials_rate_limited": is_rate_limited_auth_error(exc),
-                    "credentials_terminal": bool(exc.relogin_required)}
+            rate_limited = is_rate_limited_auth_error(exc)
+            terminal = bool(exc.relogin_required) or (
+                not rate_limited and exc.code in CREDENTIAL_MISSING_CODES)
+            return {"credentials_rate_limited": rate_limited,
+                    "credentials_terminal": terminal}
         exc = exc.__cause__ or exc.__context__
     return {}

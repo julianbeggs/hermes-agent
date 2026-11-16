@@ -15,7 +15,10 @@ import sys
 import time
 
 from agent.managed_worker import ACTIVITY_FRAME, accept_result, activity_interval, encode_frame, read_frame
-from gateway.session_worker_reservation import owner_worker_subject, reserve_admission_worker
+from gateway.session_worker_reservation import (
+    fail_admission_worker, lose_admission_worker,
+    owner_worker_subject, reserve_admission_worker,
+)
 from hermes_state_runtime import RuntimeStoreError
 
 # The interpreter only imports psutil before it introduces itself; a child silent this long
@@ -601,6 +604,24 @@ async def _settle_lost(authority, row, scope, recording):
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
 
 
+async def _settle_pre_exec_failure(authority, row, scope, recording):
+    """Settle a kanban managed worker that failed before executing as ``terminal``/``failed``.
+
+    ``unknown`` would fence provably-unexecuted work as "possibly lost" (the kanban worker client
+    raises ``GatewayClientError('Kanban execution unknown; retained by owner')`` in response).
+    A pre-execution failure from a worker whose agent construction crashed (missing credential,
+    invalid provider config) provably executed nothing — no delta, result or tool.* frame was
+    exchanged — so settle ``terminal``/``failed`` to let the dispatcher read the board exit code
+    and retry or block the task.
+    """
+    from gateway.session_runtime_workers import tracked_write
+    try:
+        if recording is not None:
+            await asyncio.wait({recording}, timeout=LOSS_RECORD_WAIT_S)
+    finally:
+        await tracked_write(authority, partial(fail_admission_worker, authority, row, scope))
+
+
 async def _spawn_registered_worker(authority, ref, row):
     """Spawn the turn's child and register it for Stops: ``(worker, process)``, or None when the spawn was cancelled (the
     interrupted result is already recorded). The generation stays marked spawning until registration."""
@@ -716,6 +737,7 @@ async def execute_managed(authority, ref, row, policy):
     authority.adopt_agent(ref.session_id, row['generation'], worker)
     accepted = usage = None
     scope = None
+    _executed = False  # True when any execution frame (delta, result, tool.*) is observed
     try:
         # The interpreter behind the handle introduces itself first; the owner verifies that
         # identity (alive, same birth, descends from the handle) before reserving for it.
@@ -743,16 +765,21 @@ async def execute_managed(authority, ref, row, policy):
                 if _prompt_frame(authority, ref, row, worker, frame):
                     continue
             if frame == {'type': 'error', 'reason': 'managed_worker_failed'}:
+                if not _executed:
+                    raise RuntimeStoreError('managed_worker_failed_pre_exec')
                 raise RuntimeStoreError('managed_worker_failed')
             kind = frame.get('type')
             if kind == 'ready' and set(frame) == {'type', 'pid'} and frame['pid'] == scope['pid']:
                 continue
             if kind == 'delta' and set(frame) == {'type', 'text'} and isinstance(frame['text'], str):
+                _executed = True
                 authority.publish_execution(ref.session_id, row['generation'], 'message.delta', {'text': frame['text']})
                 continue
             if publish_worker_tool_event(authority, ref.session_id, row['generation'], frame):
+                _executed = True
                 continue
             if kind == 'result' and set(frame) == {'type', 'result'} and accepted is None:
+                _executed = True
                 try:
                     accepted, usage = accept_result(frame['result'])
                 except ValueError as exc:
@@ -785,6 +812,29 @@ async def execute_managed(authority, ref, row, policy):
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             _record_lost_attempt(authority, policy, exc, reason, scope)  # nothing bound: a late note is dropped, never misbooked
             raise
+        if isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_failed_pre_exec':
+            # The worker failed before any execution frame was exchanged — agent construction
+            # crashed (missing/invalid credentials, corrupt config, etc.). This is provably a
+            # pre-execution failure: no delta, result or tool.* frame was ever published.
+            if policy.kanban_json is not None:
+                # Kanban only: settle terminal/failed so the receipt reads 'terminal' and the
+                # kanban worker client evaluates the board exit code instead of reporting
+                # 'execution unknown; retained by owner'. Non-kanban sessions keep the existing
+                # 'unknown' settlement (nothing changes for them).
+                await _settle_pre_exec_failure(
+                    authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
+                live = authority.sessions[ref.session_id]
+                with live.event_stream.lock:
+                    live.controls.snapshot(ref.session_id, None)
+                    authority._publish_pending(ref)
+                    live.event_stream.publish(ref.session_id, {
+                        'text': 'Worker failed before executing.', 'outcome': 'failed',
+                        'admission_id': row['admission_id'], 'status': 'error'})
+                waiter = authority.waiters.pop(row['admission_id'], None)
+                if waiter is not None and not waiter.done():
+                    waiter.set_result('Worker failed before executing.')
+                raise ManagedExecutionUnknown('managed_worker_failed') from exc
+            # Non-kanban: fall through to the existing 'unknown' settlement below.
         await _settle_lost(authority, row, scope, _record_lost_attempt(authority, policy, exc, reason, scope))
         live = authority.sessions[ref.session_id]
         with live.event_stream.lock:
